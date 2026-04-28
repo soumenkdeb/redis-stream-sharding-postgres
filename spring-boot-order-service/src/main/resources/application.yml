@@ -1,0 +1,22 @@
+server:
+  port: 8000
+
+spring:
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orders_db
+    username: postgres
+    password: postgres123
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+
+app:
+  redis:
+    urls: redis://:123456@localhost:6379,redis://:123456@localhost:6380,redis://:123456@localhost:6381,redis://:123456@localhost:6382
+  num-shards: 4
+  stream-base: orders:stream
+  group-name: order_processors
+  consumer-name: spring-consumer-1

@@ -1,0 +1,58 @@
+# ── Maven / Java build output ─────────────────────────────────────────────────
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# ── Java compiled files ───────────────────────────────────────────────────────
+*.class
+*.jar
+*.war
+*.ear
+
+# ── Python venv (if run from repo root) ───────────────────────────────────────
+bin/
+include/
+lib/
+lib64/
+share/
+pyvenv.cfg
+
+# ── Python cache and bytecode ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+
+# ── Python distribution / packaging ──────────────────────────────────────────
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Secrets and local config ─────────────────────────────────────────────────
+.env
+*.env.local
+*.env.*.local
+secrets/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+.settings/
+*.swp
+*.swo
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Test / coverage output ────────────────────────────────────────────────────
+.coverage
+htmlcov/
+surefire-reports/

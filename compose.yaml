@@ -1,0 +1,119 @@
+services:
+  redis-0:
+    image: docker.io/library/redis:latest
+    container_name: redis-0
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass 123456 --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-0-data:/data:Z
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "123456", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-1:
+    image: docker.io/library/redis:latest
+    container_name: redis-1
+    ports:
+      - "6380:6379"
+    command: redis-server --requirepass 123456 --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-1-data:/data:Z
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "123456", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-2:
+    image: docker.io/library/redis:latest
+    container_name: redis-2
+    ports:
+      - "6381:6379"
+    command: redis-server --requirepass 123456 --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-2-data:/data:Z
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "123456", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-3:
+    image: docker.io/library/redis:latest
+    container_name: redis-3
+    ports:
+      - "6382:6379"
+    command: redis-server --requirepass 123456 --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-3-data:/data:Z
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "123456", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-insight:
+    image: docker.io/redis/redisinsight:latest
+    container_name: redis-insight
+    ports:
+      - "5540:5540"
+    environment:
+      - RI_ACCEPT_TERMS_AND_CONDITIONS=true
+    volumes:
+      - redis-insight-data:/data:Z
+    depends_on:
+      redis-0:
+        condition: service_healthy
+      redis-1:
+        condition: service_healthy
+      redis-2:
+        condition: service_healthy
+      redis-3:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # postgres and pgadmin (keep your existing config)
+  postgres:
+    image: docker.io/postgres:16-alpine
+    container_name: postgres-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+      POSTGRES_DB: orders_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data:Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    ports:
+      - "8080:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_SERVER_MODE: "True"
+      PGADMIN_DISABLE_SSL: "True"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin:Z
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  redis-0-data:
+  redis-1-data:
+  redis-2-data:
+  redis-3-data:
+  redis-insight-data:
+  postgres-data:
+  pgadmin-data:

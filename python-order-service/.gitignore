@@ -1,0 +1,22 @@
+# Python venv directories (created by `python -m venv .`)
+bin/
+include/
+lib/
+lib64/
+share/
+pyvenv.cfg
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Test / coverage output
+.coverage
+htmlcov/
