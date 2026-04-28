@@ -71,15 +71,17 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 
 ## Projects
 
-### 1. Python — `producer.py` / `consumer.py`
+### 1. Python — `python-order-service/`
 
 **Runtime**: Python 3.12+, FastAPI, asyncio, asyncpg, redis-py async
 
-**Producer**: FastAPI async endpoint, single-shard Redis client per worker process (`uvicorn --workers N`).
+**Producer**: FastAPI async endpoint with `lifespan` context manager. One async Redis client per shard; shard routing uses `hashlib.sha1` for a stable hash that is consistent across all `uvicorn --workers N` processes (Python's built-in `hash()` is randomised per process via `PYTHONHASHSEED` — using it would route the same `order_id` to different shards in different workers).
 
-**Consumer**: `asyncio.gather` launches one coroutine per shard; each coroutine runs `XREADGROUP` in a loop with a 2-second block. `asyncpg` handles pooled async inserts.
+**Consumer**: `asyncio.gather` launches one coroutine per shard. Each coroutine pulls up to 500 messages per `XREADGROUP` call, inserts them all via `asyncpg.executemany()` in one round trip (`SET synchronous_commit=off` removes the WAL fsync wait), then XACK's all IDs in a single varargs Redis command. XACK is only called after a successful DB write — on failure the batch is retried from the PEL.
 
-**Throughput**: ~30,000–80,000 orders/sec depending on core count and uvicorn worker count. The GIL limits true parallelism on CPU-bound work but the I/O-bound nature of this pipeline means asyncio largely sidesteps it.
+**Throughput**: ~30,000–80,000 orders/sec through the HTTP producer (uvicorn worker-bound). Direct Redis writes via `load_test_sharded.py` reach 300,000–600,000/sec, bypassing FastAPI entirely. The GIL limits true parallelism on CPU-bound work but the I/O-bound nature of this pipeline means asyncio largely sidesteps it.
+
+**Tests**: 31 tests passing — `test_sharding.py` (hash stability, range, distribution), `test_producer.py` (HTTP contract, shard routing, input validation with mocked Redis), `test_consumer.py` (insert correctness, XACK ordering, error isolation, idempotent DDL).
 
 ### 2. Spring Boot — `spring-boot-order-service/`
 
@@ -87,7 +89,7 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 
 **Producer**: WebFlux `@RestController` on a Netty event loop. Reactive Lettuce multiplexes all in-flight `XADD` calls over a single TCP connection per shard — no thread-per-request, no head-of-line blocking.
 
-**Consumer**: `ApplicationRunner` spawns one virtual thread per shard on startup. Each virtual thread runs a tight blocking `XREADGROUP` poll. Virtual threads park (not block an OS thread) during the 2-second Redis block, consuming almost no resources while idle.
+**Consumer**: `ApplicationRunner` spawns one virtual thread per shard. Each thread pulls up to 500 messages per poll (`XReadArgs.Builder.count(500)`), inserts the full batch via `JdbcTemplate.batchUpdate()` in one DB round trip, then XACK's all IDs in one Lettuce varargs call. `synchronous_commit=off` is set via HikariCP `connection-init-sql`, removing the WAL fsync overhead per commit.
 
 **Throughput**: ~150,000–400,000 orders/sec producer side under load. Consumer throughput is linear with shard count.
 
@@ -99,7 +101,7 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 
 **Producer**: `@RunOnVirtualThread` on the JAX-RS endpoint dispatches each request to a fresh virtual thread. Blocking Lettuce `sync().xadd()` runs on that virtual thread — simple, readable, and just as efficient as reactive code because virtual thread parking costs ~200 bytes of heap vs ~1 MB for a platform thread stack.
 
-**Consumer**: `@Observes StartupEvent` spawns one virtual thread per shard, identical pattern to Spring Boot. Datasource is injected as `AgroalDataSource` (Quarkus's concrete JDBC bean type).
+**Consumer**: `@Observes StartupEvent` spawns one virtual thread per shard. Pulls up to 500 messages per poll, batches them via JDBC `addBatch()`/`executeBatch()` inside an explicit transaction (`setAutoCommit(false)` + `commit()`), then XACK's all IDs in one varargs call. `synchronous_commit=off` is set via `quarkus.datasource.jdbc.new-connection-sql`. On DB failure the transaction is rolled back and XACK is skipped — messages stay in the PEL.
 
 **Throughput**: Comparable to Spring Boot. Quarkus has a faster cold start (~0.4 s vs ~2 s for Spring Boot) which matters in auto-scaling environments where new pods spin up under surge load.
 
@@ -118,10 +120,19 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 │       └── redis-insights-consumer-groups.png  # RedisInsight consumer group pending counts
 ├── compose.yaml                         # All infrastructure (4 Redis, Postgres, pgAdmin, RedisInsight)
 ├── .env                                 # Runtime config (URLs, DSN)
-├── producer.py                          # Python FastAPI producer
-├── consumer.py                          # Python asyncio consumer
-├── load_test_sharded.py                 # Load generator: 1M orders, 300 concurrent workers
-├── requirements.txt
+├── python-order-service/
+│   ├── producer.py                      # FastAPI producer (lifespan, stable hashlib routing)
+│   ├── consumer.py                      # asyncio consumer (batch inserts, bulk XACK)
+│   ├── load_test_sharded.py             # Direct Redis load test: bypasses producer, 1M orders
+│   ├── load_test_producer.py            # HTTP load test: POSTs to producer, full-stack benchmark
+│   ├── requirements.txt                 # Runtime dependencies
+│   ├── requirements-dev.txt             # Test dependencies (pytest, pytest-asyncio, httpx)
+│   ├── pytest.ini                       # asyncio_mode=auto, testpaths=tests
+│   └── tests/
+│       ├── conftest.py                  # Shared fixtures: mock Redis, mock asyncpg pool
+│       ├── test_sharding.py             # Shard range, determinism, distribution (11 tests)
+│       ├── test_producer.py             # HTTP contract + routing with mocked Redis (14 tests)
+│       └── test_consumer.py             # process_message, create_table, consume_shard (10 tests)
 ├── spring-boot-order-service/
 │   ├── pom.xml                          # Java 21, WebFlux, Lettuce, JDBC + test deps
 │   ├── start.sh                         # Tuned JVM startup (ZGC, virtual thread pool)
@@ -193,15 +204,19 @@ podman compose ps
 ### 2. Python Producer & Consumer
 
 ```bash
+cd python-order-service
 python -m venv .
 source bin/activate          # fish: source bin/activate.fish
 pip install -r requirements.txt
 
-# Terminal 1: producer
+# Terminal 1: producer (workers = CPU cores for maximum throughput)
 uvicorn producer:app --host 0.0.0.0 --port 8000 --workers 4
 
 # Terminal 2: consumer
 python consumer.py
+
+# Override shard count or consumer name at runtime
+NUM_SHARDS=8 CONSUMER_NAME=worker-2 python consumer.py
 ```
 
 ### 3. Spring Boot
@@ -259,26 +274,54 @@ Expected response:
 {"status": "queued", "message_id": "1714123456789-0", "shard": "2"}
 ```
 
-### 6. Run the Load Test (Python)
+### 6. Run the Load Tests (Python)
 
+Two load tests are available — choose based on what you want to benchmark:
+
+**Direct Redis** — bypasses the producer HTTP layer entirely. Benchmarks raw Redis + network throughput. Producer does not need to be running.
 ```bash
+cd python-order-service
 python load_test_sharded.py
-# Generates 1,000,000 orders across 4 shards with 300 concurrent workers
+# 1,000,000 orders, 300 concurrent workers, direct XADD to Redis shards
 ```
+
+**HTTP producer** — posts through the full stack (FastAPI → Pydantic → shard routing → Redis). Benchmarks real producer throughput including HTTP overhead and uvicorn worker limits.
+```bash
+# Terminal 1: start the producer first
+uvicorn producer:app --host 0.0.0.0 --port 8000 --workers 4
+
+# Terminal 2: run the HTTP load test
+python load_test_producer.py
+
+# Override defaults
+TOTAL_ORDERS=500000 CONCURRENCY=300 python load_test_producer.py
+```
+
+| Test | What it measures | Producer needed |
+|---|---|---|
+| `load_test_sharded.py` | Redis write ceiling | No |
+| `load_test_producer.py` | Full HTTP stack throughput | **Yes** |
 
 ### 7. Run Tests
 
 ```bash
-# Spring Boot — unit + integration (starts Testcontainers automatically)
+# Python — 31 unit tests, no infrastructure needed (all deps mocked)
+cd python-order-service
+pip install -r requirements-dev.txt
+bin/python -m pytest tests/ -v
+
+# Spring Boot — 16 tests: unit + @WebFluxTest + Testcontainers end-to-end
 cd spring-boot-order-service
 mvn test
 
-# Quarkus — unit + integration
+# Quarkus — unit + Testcontainers end-to-end
 cd quarkus-order-service
 mvn test
 ```
 
-Both projects have 7+ tests each. Integration tests use Testcontainers to spin up Redis and PostgreSQL containers, pre-seed the consumer group, POST orders via HTTP, and await consumer processing with Awaitility before asserting on database rows and XACK state.
+**Python tests** run in ~0.3 s — all external calls (Redis, Postgres) are mocked with `AsyncMock`. No Docker or running services required.
+
+**Java tests** use Testcontainers to spin up real Redis and PostgreSQL containers, pre-seed the consumer group, POST orders via HTTP, and await consumer processing with Awaitility before asserting on database rows and XACK state.
 
 ### 8. Verify Rows in pgAdmin
 
@@ -416,6 +459,55 @@ Both `testcontainers.properties` files in `src/test/resources/` already contain 
 
 ## Key Implementation Notes
 
+### Python Hash Stability
+
+Python's built-in `hash()` is randomised on every interpreter start (`PYTHONHASHSEED`). With `uvicorn --workers 4`, each worker is a separate process with a different seed, so `hash("ORD-001")` returns a different value per worker — the same `order_id` can land on a different shard depending on which worker handles the request.
+
+All three Python files (`producer.py`, `consumer.py`, `load_test_sharded.py`) use `hashlib.sha1` instead:
+
+```python
+import hashlib
+
+def get_shard(order_id: str) -> int:
+    return int(hashlib.sha1(order_id.encode()).hexdigest(), 16) % NUM_SHARDS
+```
+
+This produces the same shard assignment across all workers, restarts, and machines.
+
+### FastAPI Lifespan
+
+`@app.on_event("startup")` / `@app.on_event("shutdown")` are deprecated since FastAPI 0.93. The `lifespan` context manager is the current pattern — setup before `yield`, teardown after:
+
+```python
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    clients = [redis.from_url(url) for url in REDIS_URLS]  # startup
+    yield
+    for c in clients: await c.aclose()                      # shutdown
+
+app = FastAPI(lifespan=lifespan)
+```
+
+### Batch Insert + `synchronous_commit=off`
+
+All three consumers batch messages and flush them in one DB round trip per poll cycle. The flow per shard per loop iteration:
+
+```
+xreadgroup (count=500) → parse all → INSERT batch → XACK all IDs
+       ↑ 1 Redis read        ↑ CPU only   ↑ 1 DB write  ↑ 1 Redis write
+```
+
+`synchronous_commit=off` is set at connection level so Postgres acknowledges the commit before flushing WAL to disk. This removes the fsync wait (1–5 ms on HDD, ~0.1 ms on NVMe) without affecting durability of already-committed data — only the last ~200 ms of commits can be lost on a hard crash, and Redis retains those messages in the Pending Entries List for re-delivery.
+
+| Metric | Per-message (old) | Batched (new) |
+|---|---|---|
+| DB round trips per 500 msgs | 500 | 1 |
+| Redis XACK calls per 500 msgs | 500 | 1 |
+| WAL fsync calls per 500 msgs | 500 | 1 |
+| Effective insert throughput | ~5–20k rows/sec | ~50–200k rows/sec |
+
 ### Lettuce API (6.3.x)
 
 `StreamOffset` is a **nested static class** of `XReadArgs`, not a top-level class. Always reference it as `XReadArgs.StreamOffset`:
@@ -472,8 +564,10 @@ This guarantees that any message published during the test is always visible to 
 
 | Optimisation | Impact | How |
 |---|---|---|
-| Increase `xreadgroup COUNT` from 50 to 500 | Fewer Redis round trips per consumer loop | `XReadArgs.Builder.count(500)` |
-| Batch JDBC inserts with `executeBatch` | 5–10× DB write throughput | Accumulate a `List<Order>` per shard tick, flush with `addBatch` / `executeBatch` |
+| ~~Increase `xreadgroup COUNT` from 50 to 500~~ | ✅ Done — `app.batch-size=500` | Already applied in all three runtimes |
+| ~~Batch JDBC inserts with `executeBatch`~~ | ✅ Done — 10–50× DB throughput | `executemany` (Python), `batchUpdate` (Spring Boot), `addBatch/executeBatch` (Quarkus) |
+| ~~`synchronous_commit=off`~~ | ✅ Done — removes WAL fsync wait | Set via `connection-init-sql` / `new-connection-sql` / asyncpg session setting |
+| ~~Shard-local bulk XACK~~ | ✅ Done — 1 Redis call per batch | `xack(stream, group, *ids)` varargs in all three runtimes |
 | Tune HikariCP / Agroal pool size | Match pool to consumer concurrency | `maximum-pool-size = numShards * consumerThreadsPerShard` |
 | GraalVM native image (Quarkus) | ~10× faster cold start, ~50% less RAM | `mvn package -Pnative`; eliminates JIT warmup cost |
 | Spring AOT + CRaC checkpoint/restore | Near-instant restart for Spring Boot | `spring-boot:process-aot`, restore from CRaC checkpoint |
@@ -509,13 +603,13 @@ These are indicative figures on a modern 8-core machine. Actual results depend o
 
 | Scenario | Approx. Orders/sec |
 |---|---|
-| Python producer, 4 uvicorn workers | 30,000 – 80,000 |
-| Python load test (direct Redis, no HTTP) | 300,000 – 600,000 |
+| Python HTTP producer, 4 uvicorn workers (`load_test_producer.py`) | 30,000 – 80,000 |
+| Python direct Redis, no HTTP (`load_test_sharded.py`) | 300,000 – 600,000 |
 | Spring Boot WebFlux producer (JIT warmed) | 150,000 – 400,000 |
 | Quarkus producer (JIT warmed) | 140,000 – 380,000 |
 | Quarkus native image producer | 200,000 – 450,000 |
-| Consumer (all runtimes, 4 virtual threads) | Matches producer throughput |
-| Consumer with batched JDBC `executeBatch` | 2–5× above baseline |
+| Consumer — single-row INSERT (old baseline) | ~5,000 – 20,000 rows/sec |
+| Consumer — batch 500 rows + `synchronous_commit=off` | 50,000 – 200,000 rows/sec |
 
 The effective system ceiling is whichever of these is smallest:
 `min(producer throughput, Redis write throughput, consumer throughput, PG insert throughput)`
