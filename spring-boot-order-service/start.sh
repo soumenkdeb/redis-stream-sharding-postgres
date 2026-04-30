@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Exit immediately on error, unset variable, or failed pipeline
 set -euo pipefail
 
 # Resolve project root so the script works when called from any directory

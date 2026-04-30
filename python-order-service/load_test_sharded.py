@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import random
 import time
@@ -16,7 +17,8 @@ CONCURRENCY = 300
 PRODUCTS = ["Laptop", "Smartphone", "Headphones", "Tablet", "Smartwatch", "Keyboard", "Mouse"]
 
 def get_redis_index(order_id: str) -> int:
-    return hash(order_id) % NUM_SHARDS
+    # Must match producer.get_shard() — same stable hashlib.sha1 approach.
+    return int(hashlib.sha1(order_id.encode()).hexdigest(), 16) % NUM_SHARDS
 
 async def generate_order(order_num: int):
     items = random.sample(PRODUCTS, random.randint(1, 4))

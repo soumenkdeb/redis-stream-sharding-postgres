@@ -2,6 +2,8 @@
 
 A horizontally-sharded order ingestion pipeline built on Redis Streams and PostgreSQL, implemented in three runtimes: **Python (FastAPI)**, **Spring Boot (WebFlux)**, and **Quarkus**. Designed to sustain hundreds of thousands of deal bookings per second with sub-millisecond producer latency.
 
+> **Learning reference**: see [SKILLS.md](SKILLS.md) for a detailed breakdown of every engineering skill demonstrated in this project — Redis Streams, sharding, resilience patterns, async Python, virtual threads, Testcontainers, Prometheus observability, and more.
+
 ---
 
 ## Why This Architecture Is Fast for Booking Deals
@@ -46,6 +48,8 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
                           ┌─────────────────────────────────────────┐
                           │           Producer (HTTP API)            │
                           │  POST /orders  →  hash(order_id) % 4   │
+                          │  GET  /ack/status?ids=…                 │
+                          │  GET  /ack/summary                      │
                           └──────────┬──────┬──────┬──────┬─────────┘
                                      │      │      │      │
                                   shard:0 shard:1 shard:2 shard:3
@@ -53,12 +57,14 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
                           ┌──────────▼──────▼──────▼──────▼─────────┐
                           │           4 × Redis Stream               │
                           │   orders:stream:0  …  orders:stream:3   │
-                          │   port 6379       …  port 6382          │
+                          │   orders:acks:0    …  orders:acks:3     │
+                          │   port 6379        …  port 6382         │
                           └──────────┬──────┬──────┬──────┬─────────┘
                                      │      │      │      │
                           ┌──────────▼──────▼──────▼──────▼─────────┐
                           │    Consumer (4 virtual threads)          │
-                          │    XREADGROUP → parse → INSERT → XACK   │
+                          │    XREADGROUP → INSERT → XACK            │
+                          │    → buffer order_ids → HSET acks hash  │
                           └───────────────────┬─────────────────────┘
                                               │
                           ┌───────────────────▼─────────────────────┐
@@ -77,11 +83,11 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 
 **Producer**: FastAPI async endpoint with `lifespan` context manager. One async Redis client per shard; shard routing uses `hashlib.sha1` for a stable hash that is consistent across all `uvicorn --workers N` processes (Python's built-in `hash()` is randomised per process via `PYTHONHASHSEED` — using it would route the same `order_id` to different shards in different workers).
 
-**Consumer**: `asyncio.gather` launches one coroutine per shard. Each coroutine pulls up to 500 messages per `XREADGROUP` call, inserts them all via `asyncpg.executemany()` in one round trip (`SET synchronous_commit=off` removes the WAL fsync wait), then XACK's all IDs in a single varargs Redis command. XACK is only called after a successful DB write — on failure the batch is retried from the PEL.
+**Consumer**: `asyncio.gather` launches one coroutine per shard. Each coroutine pulls up to 500 messages per `XREADGROUP` call, inserts them all via `asyncpg.executemany()` in one round trip (`SET synchronous_commit=off` removes the WAL fsync wait), then XACK's all IDs in a single varargs Redis command. XACK is only called after a successful DB write — on failure the batch is retried from the PEL. After each successful DB commit, `order_id`s are buffered and flushed to `orders:acks:{shard}` (Redis Hash, TTL 24 h) when `ACK_BATCH_SIZE` is reached or `ACK_FLUSH_INTERVAL` seconds elapse.
 
 **Throughput**: ~30,000–80,000 orders/sec through the HTTP producer (uvicorn worker-bound). Direct Redis writes via `load_test_sharded.py` reach 300,000–600,000/sec, bypassing FastAPI entirely. The GIL limits true parallelism on CPU-bound work but the I/O-bound nature of this pipeline means asyncio largely sidesteps it.
 
-**Tests**: 31 tests passing — `test_sharding.py` (hash stability, range, distribution), `test_producer.py` (HTTP contract, shard routing, input validation with mocked Redis), `test_consumer.py` (insert correctness, XACK ordering, error isolation, idempotent DDL).
+**Tests**: 58 tests passing — `test_sharding.py` (hash stability, range, distribution), `test_producer.py` (HTTP contract, shard routing, input validation with mocked Redis), `test_consumer.py` (insert correctness, XACK ordering, error isolation, idempotent DDL), `test_resilience.py` (circuit breaker state machine, retry backoff, timeout, producer/consumer integration).
 
 ### 2. Spring Boot — `spring-boot-order-service/`
 
@@ -89,7 +95,7 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 
 **Producer**: WebFlux `@RestController` on a Netty event loop. Reactive Lettuce multiplexes all in-flight `XADD` calls over a single TCP connection per shard — no thread-per-request, no head-of-line blocking.
 
-**Consumer**: `ApplicationRunner` spawns one virtual thread per shard. Each thread pulls up to 500 messages per poll (`XReadArgs.Builder.count(500)`), inserts the full batch via `JdbcTemplate.batchUpdate()` in one DB round trip, then XACK's all IDs in one Lettuce varargs call. `synchronous_commit=off` is set via HikariCP `connection-init-sql`, removing the WAL fsync overhead per commit.
+**Consumer**: `ApplicationRunner` spawns one virtual thread per shard. Each thread pulls up to 500 messages per poll (`XReadArgs.Builder.count(500)`), inserts the full batch via `JdbcTemplate.batchUpdate()` in one DB round trip, then XACK's all IDs in one Lettuce varargs call. `synchronous_commit=off` is set via HikariCP `connection-init-sql`, removing the WAL fsync overhead per commit. After XACK, `order_id`s are buffered and flushed to `orders:acks:{shard}` via `HSET` when `app.ack-batch-size` (default 500) is reached or `app.ack-flush-interval-ms` (default 5 000 ms) elapses.
 
 **Throughput**: ~150,000–400,000 orders/sec producer side under load. Consumer throughput is linear with shard count.
 
@@ -101,7 +107,7 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 
 **Producer**: `@RunOnVirtualThread` on the JAX-RS endpoint dispatches each request to a fresh virtual thread. Blocking Lettuce `sync().xadd()` runs on that virtual thread — simple, readable, and just as efficient as reactive code because virtual thread parking costs ~200 bytes of heap vs ~1 MB for a platform thread stack.
 
-**Consumer**: `@Observes StartupEvent` spawns one virtual thread per shard. Pulls up to 500 messages per poll, batches them via JDBC `addBatch()`/`executeBatch()` inside an explicit transaction (`setAutoCommit(false)` + `commit()`), then XACK's all IDs in one varargs call. `synchronous_commit=off` is set via `quarkus.datasource.jdbc.new-connection-sql`. On DB failure the transaction is rolled back and XACK is skipped — messages stay in the PEL.
+**Consumer**: `@Observes StartupEvent` spawns one virtual thread per shard. Pulls up to 500 messages per poll, batches them via JDBC `addBatch()`/`executeBatch()` inside an explicit transaction (`setAutoCommit(false)` + `commit()`), then XACK's all IDs in one varargs call. `synchronous_commit=off` is set via `quarkus.datasource.jdbc.new-connection-sql`. On DB failure the transaction is rolled back and XACK is skipped — messages stay in the PEL. Ack buffering follows the same pattern as Spring Boot: `HSET orders:acks:{shard}` flushed at `app.ack-batch-size` / `app.ack-flush-interval-ms`.
 
 **Throughput**: Comparable to Spring Boot. Quarkus has a faster cold start (~0.4 s vs ~2 s for Spring Boot) which matters in auto-scaling environments where new pods spin up under surge load.
 
@@ -113,6 +119,7 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 
 ```
 .
+├── SKILLS.md                            # Engineering skills index with code examples
 ├── docs/
 │   └── screenshots/
 │       ├── pgadmin4.png                 # pgAdmin4 dashboard with live activity graphs
@@ -121,18 +128,20 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 ├── compose.yaml                         # All infrastructure (4 Redis, Postgres, pgAdmin, RedisInsight)
 ├── .env                                 # Runtime config (URLs, DSN)
 ├── python-order-service/
-│   ├── producer.py                      # FastAPI producer (lifespan, stable hashlib routing)
-│   ├── consumer.py                      # asyncio consumer (batch inserts, bulk XACK)
+│   ├── producer.py                      # FastAPI producer + /ack/status + /ack/summary endpoints
+│   ├── consumer.py                      # asyncio consumer (batch inserts, XACK, ack buffer → Redis)
+│   ├── resilience.py                    # CircuitBreaker + with_resilience (timeout, retry, CB)
 │   ├── load_test_sharded.py             # Direct Redis load test: bypasses producer, 1M orders
-│   ├── load_test_producer.py            # HTTP load test: POSTs to producer, full-stack benchmark
+│   ├── load_test_producer.py            # HTTP load test: Phase 1 send + Phase 2 ack poll
 │   ├── requirements.txt                 # Runtime dependencies
 │   ├── requirements-dev.txt             # Test dependencies (pytest, pytest-asyncio, httpx)
 │   ├── pytest.ini                       # asyncio_mode=auto, testpaths=tests
 │   └── tests/
-│       ├── conftest.py                  # Shared fixtures: mock Redis, mock asyncpg pool
+│       ├── conftest.py                  # Shared fixtures: mock Redis, mock asyncpg pool, CB init
 │       ├── test_sharding.py             # Shard range, determinism, distribution (11 tests)
 │       ├── test_producer.py             # HTTP contract + routing with mocked Redis (14 tests)
-│       └── test_consumer.py             # process_message, create_table, consume_shard (10 tests)
+│       ├── test_consumer.py             # flush_batch, create_table, consume_shard (10 tests)
+│       └── test_resilience.py           # CB state machine, retry backoff, timeout (29 tests)
 ├── spring-boot-order-service/
 │   ├── pom.xml                          # Java 21, WebFlux, Lettuce, JDBC + test deps
 │   ├── start.sh                         # Tuned JVM startup (ZGC, virtual thread pool)
@@ -142,6 +151,7 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
 │       │   ├── config/RedisConfig.java  # One StatefulRedisConnection per shard
 │       │   ├── model/Order.java
 │       │   ├── producer/OrderController.java
+│       │   ├── producer/AckController.java  # GET /ack/status, GET /ack/summary
 │       │   └── consumer/ShardedConsumer.java
 │       ├── main/resources/application.yml
 │       └── test/
@@ -158,6 +168,7 @@ The async consumer pattern decouples the HTTP write path (Redis, sub-millisecond
         │   ├── config/RedisConfig.java  # @ApplicationScoped, @PostConstruct init
         │   ├── model/Order.java
         │   ├── producer/OrderResource.java
+        │   ├── producer/AckResource.java    # GET /ack/status, GET /ack/summary
         │   └── consumer/ShardedConsumer.java
         ├── main/resources/application.properties
         └── test/
@@ -274,6 +285,30 @@ Expected response:
 {"status": "queued", "message_id": "1714123456789-0", "shard": "2"}
 ```
 
+Check health, metrics, and ack status (Python producer):
+```bash
+curl http://localhost:8000/health    # circuit breaker states
+curl http://localhost:8000/metrics   # Prometheus scrape
+curl http://localhost:9090/metrics   # consumer metrics
+
+# Check whether a specific order reached Postgres
+curl "http://localhost:8000/ack/status?ids=ORD-001"
+# {"total":1,"acked":1,"pending":0,"pct_complete":100.0,"orders":{"ORD-001":"acked"}}
+
+# Bulk check (comma-separated, max 10 000 ids)
+curl "http://localhost:8000/ack/status?ids=ORD-001,ORD-002,ORD-003"
+
+# Total acked count per shard (no ID list needed)
+curl http://localhost:8000/ack/summary
+# {"total_acked":47823,"by_shard":[{"shard":0,"acked":11982},…]}
+```
+
+Spring Boot exposes the same endpoints on port 8000; Quarkus on port 8001:
+```bash
+curl "http://localhost:8001/ack/status?ids=ORD-001"
+curl  http://localhost:8001/ack/summary
+```
+
 ### 6. Run the Load Tests (Python)
 
 Two load tests are available — choose based on what you want to benchmark:
@@ -285,27 +320,52 @@ python load_test_sharded.py
 # 1,000,000 orders, 300 concurrent workers, direct XADD to Redis shards
 ```
 
-**HTTP producer** — posts through the full stack (FastAPI → Pydantic → shard routing → Redis). Benchmarks real producer throughput including HTTP overhead and uvicorn worker limits.
+**HTTP producer** — posts through the full stack (FastAPI → Pydantic → shard routing → Redis). Runs in two phases: **Phase 1** sends all orders and tracks submitted `order_id`s; **Phase 2** polls `GET /ack/status` until every order is confirmed persisted to Postgres or timeout elapses.
 ```bash
 # Terminal 1: start the producer first
 uvicorn producer:app --host 0.0.0.0 --port 8000 --workers 4
 
-# Terminal 2: run the HTTP load test
+# Terminal 2: also start the consumer so orders get processed
+python consumer.py
+
+# Terminal 3: run the HTTP load test
 python load_test_producer.py
 
 # Override defaults
-TOTAL_ORDERS=500000 CONCURRENCY=300 python load_test_producer.py
+TOTAL_ORDERS=500000 CONCURRENCY=300 ACK_POLL_TIMEOUT=600 python load_test_producer.py
 ```
 
-| Test | What it measures | Producer needed |
-|---|---|---|
-| `load_test_sharded.py` | Redis write ceiling | No |
-| `load_test_producer.py` | Full HTTP stack throughput | **Yes** |
+Phase 2 output example:
+```
+──────────────────────────────────────────────────
+  Phase 2 — Ack polling (99 843 orders)
+  Timeout: 300s  interval: 3s  chunk: 1000
+──────────────────────────────────────────────────
+       0 / 99 843  (  0.00%)
+   24 500 / 99 843  ( 24.54%)  +24500 this round
+   61 200 / 99 843  ( 61.30%)  +36700 this round
+   99 843 / 99 843  (100.00%)  +38643 this round
+
+  All 99 843 orders acked!
+```
+
+| Test | What it measures | Producer needed | Consumer needed |
+|---|---|---|---|
+| `load_test_sharded.py` | Redis write ceiling | No | No |
+| `load_test_producer.py` | Full HTTP stack + end-to-end ack | **Yes** | **Yes** |
+
+**Ack env vars** (load test):
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `ACK_POLL_TIMEOUT` | 300 | Seconds to wait for 100% ack before giving up |
+| `ACK_POLL_INTERVAL` | 3 | Seconds between poll rounds |
+| `ACK_CHUNK_SIZE` | 1000 | `order_id`s per `/ack/status` request |
 
 ### 7. Run Tests
 
 ```bash
-# Python — 31 unit tests, no infrastructure needed (all deps mocked)
+# Python — 58 unit tests, no infrastructure needed (all deps mocked)
 cd python-order-service
 pip install -r requirements-dev.txt
 bin/python -m pytest tests/ -v
@@ -534,6 +594,107 @@ AgroalDataSource dataSource;   // correct for Quarkus 3.x
 
 Add `quarkus-agroal` as an explicit dependency (not just transitive) and set `quarkus.datasource.devservices.enabled=false` to prevent DevServices from interfering when an explicit JDBC URL is configured.
 
+### Ack Aggregator — End-to-End Processing Confirmation
+
+The pipeline is async by design: `POST /orders` returns in <1 ms after writing to Redis, long before the consumer inserts the row into Postgres. The **Ack Aggregator** bridges this gap — it lets callers (load tests, monitoring, downstream systems) know exactly when each order has been durably committed.
+
+**How it works**:
+
+```
+Consumer DB commit succeeds
+        │
+        ▼
+order_id added to per-shard in-memory buffer
+        │
+        ├── buffer size ≥ ACK_BATCH_SIZE (500)?   ─┐
+        └── or seconds since last flush ≥ 5s?      ─┤
+                                                     ▼
+                                  HSET orders:acks:{shard} {order_id: timestamp}
+                                  EXPIRE orders:acks:{shard} 86400   (24 h TTL)
+```
+
+**Producer reads acks** — `GET /ack/status` groups the requested `order_id`s by shard (same hash as `POST /orders`), then issues one `HMGET` per shard:
+
+```bash
+curl "http://localhost:8000/ack/status?ids=ORD-001,ORD-002,ORD-003"
+```
+```json
+{
+  "total": 3,
+  "acked": 2,
+  "pending": 1,
+  "pct_complete": 66.67,
+  "orders": {
+    "ORD-001": "acked",
+    "ORD-002": "acked",
+    "ORD-003": "pending"
+  }
+}
+```
+
+**Summary without listing IDs** — `GET /ack/summary` calls `HLEN` on each shard's hash (O(1)):
+
+```bash
+curl http://localhost:8000/ack/summary
+# {"total_acked": 99843, "by_shard": [{"shard": 0, "acked": 24960}, …]}
+```
+
+**Configuration** — same env vars / properties across all three runtimes:
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `ACK_BATCH_SIZE` / `app.ack-batch-size` | 500 | Flush ack hash after N order_ids buffered |
+| `ACK_FLUSH_INTERVAL` / `app.ack-flush-interval-ms` | 5 s | Or after this interval (prevents stale acks under low traffic) |
+| `ACK_KEY_TTL` | 86 400 s | Redis Hash TTL — auto-cleaned after 24 h |
+
+**Why Redis Hash and not a separate stream?**
+
+`HSET` + `HMGET` give O(1) writes and O(k) reads for k requested IDs — no consumer group, no cursor, no re-delivery. The ack hash is stored on the **same Redis shard** as the order stream so no extra network hop is needed. The 24 h TTL prevents unbounded growth without any maintenance job.
+
+**Why buffer on the consumer and not write one HSET per order?**
+
+The same batch amortisation principle as `executemany` + bulk `XACK` — one `HSET` with 500 field-value pairs costs one Redis round trip instead of 500.
+
+### Resilience Patterns (Python)
+
+The Python producer and consumer wrap every external call in three layered safety nets defined in `resilience.py`.
+
+```
+Request → allow_request()? → asyncio.wait_for(coro, 10s) → on_success / on_failure
+               ↑ OPEN: raise immediately (fail fast)
+               ↑ HALF_OPEN: allow one probe
+```
+
+**Timeout** — each individual Redis or Postgres call is wrapped in `asyncio.wait_for(coro, timeout=10)`. A stuck connection is cancelled after 10 s rather than blocking the event loop indefinitely.
+
+**Retry with exponential backoff** — after a timeout or error the call is retried up to 3 times total. The wait between attempts doubles: 1 s → 2 s. Only after all three attempts fail is the circuit breaker notified. This prevents the circuit from opening on brief transient blips that self-recover within one retry window.
+
+**Circuit Breaker** — tracks retry-exhaustion events (not individual call failures). After 3 such events the circuit opens and all subsequent calls are rejected instantly with `CircuitBreakerOpenError`, avoiding a thundering-herd against a service that is clearly down. After 30 s one probe (HALF_OPEN) is allowed; a successful probe closes the circuit, a failed probe resets the 30 s window.
+
+```
+State         allow_request()   next transition
+CLOSED        always yes        3 exhaustion events → OPEN
+OPEN          no (fail fast)    30 s elapsed → HALF_OPEN
+HALF_OPEN     yes (one probe)   success → CLOSED / failure → OPEN
+```
+
+**HTTP status codes** (producer):
+
+| Status | Meaning |
+|--------|---------|
+| `200` | Order accepted, message written to Redis |
+| `502` | Redis failed after all 3 retries |
+| `503` | Circuit is open — Redis is unhealthy, retry after 30 s |
+
+**Consumer behaviour on failure**:
+- DB circuit open → batch skipped, messages stay in Redis PEL (re-delivered when Postgres recovers)
+- All DB retries exhausted → same; no XACK, no data loss
+- XACK fails after DB success → messages re-delivered; duplicate inserts are the only risk (mitigate with `UNIQUE (order_id)`)
+
+**Separate circuit breakers**: the DB breaker and each shard's Redis breaker are independent. A Postgres outage does not affect Redis health tracking and vice versa.
+
+**Separate circuit breakers per shard**: a failure on `redis-shard-2` opens only that shard's breaker; orders routing to shards 0, 1, and 3 continue unaffected.
+
 ### Consumer Group Race Condition in Tests
 
 The consumer creates its group at offset `$` (latest) on startup. If a test message is published before the group is created, the message falls before `$` and is never delivered. Both integration test setups pre-create the group at offset `0-0` before the application starts:
@@ -587,13 +748,7 @@ This guarantees that any message published during the test is always visible to 
 
 ### Observability
 
-| Addition | Value |
-|---|---|
-| Prometheus metrics (`/metrics`) | Track orders/sec, consumer lag, insert latency |
-| Micrometer (Spring Boot) | Auto-exports JVM, Hikari, and custom metrics |
-| Quarkus SmallRye Metrics | `quarkus-micrometer-registry-prometheus` extension |
-| Consumer lag alerting | `XLEN stream` − `XPENDING stream group` → alert if lag > threshold |
-| Structured JSON logging | Easier log aggregation in ELK/Loki |
+See the dedicated [Observability](#observability-1) section below for the full implementation guide.
 
 ---
 
@@ -615,3 +770,187 @@ The effective system ceiling is whichever of these is smallest:
 `min(producer throughput, Redis write throughput, consumer throughput, PG insert throughput)`
 
 With 4 Redis shards and batched PostgreSQL inserts, the PostgreSQL `INSERT` rate (typically ~20,000–50,000 rows/sec single-threaded) is usually the first constraint to hit. The batched `COPY` or `executeBatch` optimisation listed above pushes that ceiling by an order of magnitude.
+
+---
+
+## Observability
+
+### Python — Built-in Prometheus Metrics + Structured Logging
+
+Both `producer.py` and `consumer.py` expose metrics out of the box using `prometheus_client` (already in `requirements.txt`).
+
+#### Producer endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Returns `200 ok` when all circuit breakers are closed, `503 degraded` if any are open. Use as a Kubernetes readiness probe. |
+| `GET /metrics` | Prometheus text format. Scrape with Prometheus or import into Grafana. |
+| `GET /ack/status?ids=…` | Per-order acked/pending map. Routes each ID to its shard, issues one `HMGET` per shard. |
+| `GET /ack/summary` | Total acked count per shard via `HLEN` — no ID list needed. |
+
+```bash
+# Check health
+curl http://localhost:8000/health
+
+# Scrape metrics
+curl http://localhost:8000/metrics
+```
+
+#### Producer metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `orders_published_total` | Counter | `shard` | Orders successfully written to Redis |
+| `orders_failed_total` | Counter | `shard`, `reason` | Failed orders (`circuit_open` or `retries_exhausted`) |
+| `http_request_duration_seconds` | Histogram | `status_code` | End-to-end POST /orders latency |
+| `producer_circuit_breaker_state` | Gauge | `name` | CB state per shard: 0=closed, 1=half_open, 2=open |
+
+#### Consumer metrics
+
+The consumer exposes a Prometheus HTTP server on port `9090` (override with `METRICS_PORT` env var).
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `consumer_rows_inserted_total` | Counter | `shard` | Rows written to PostgreSQL |
+| `consumer_batches_failed_total` | Counter | `shard`, `reason` | Batches that failed (`circuit_open` or `retries_exhausted`) |
+| `consumer_xack_failed_total` | Counter | `shard` | XACK failures (messages may be re-delivered) |
+| `consumer_acks_flushed_total` | Counter | `shard` | Order IDs written to ack hash after DB commit |
+| `consumer_batch_duration_seconds` | Histogram | `shard` | INSERT + XACK time per batch |
+| `consumer_circuit_breaker_state` | Gauge | `name` | CB state: 0=closed, 1=half_open, 2=open |
+
+```bash
+# Consumer metrics
+curl http://localhost:9090/metrics
+```
+
+#### Structured JSON logging
+
+All log output is in JSON — one object per line, suitable for ingestion by Loki, Fluentd, or AWS CloudWatch:
+
+```json
+{"ts": "2024-04-26T10:15:03", "level": "INFO", "logger": "producer", "msg": "Producer started — shards=4"}
+{"ts": "2024-04-26T10:15:04", "level": "INFO", "logger": "consumer", "msg": "inserted shard=2 rows=500"}
+{"ts": "2024-04-26T10:15:05", "level": "WARNING", "logger": "consumer", "msg": "db circuit open shard=0 msgs=500 err=..."}
+```
+
+Set `LOG_LEVEL=DEBUG` for per-order log lines (verbose; only useful during debugging).
+
+### Consumer Lag Query
+
+Consumer lag is the number of messages in a stream that have been delivered but not yet acknowledged. Query it directly from Redis:
+
+```bash
+# Pending count for a shard (messages delivered but not XACK'd)
+redis-cli -p 6379 -a 123456 XPENDING orders:stream:0 order_processors - + 10
+
+# Stream length vs pending — lag = XLEN - (XLEN - pending)
+redis-cli -p 6379 -a 123456 XLEN orders:stream:0
+```
+
+In Grafana, alert when `XPENDING` for any shard exceeds a threshold (e.g. >50,000 means the consumer is falling behind the producer).
+
+### Prometheus + Grafana Setup
+
+Add a `prometheus` and `grafana` service to `compose.yaml` to get a full metrics pipeline:
+
+```yaml
+prometheus:
+  image: prom/prometheus:v2.51.2
+  ports: ["9091:9090"]
+  volumes:
+    - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+grafana:
+  image: grafana/grafana:10.4.2
+  ports: ["3000:3000"]
+  environment:
+    GF_SECURITY_ADMIN_PASSWORD: admin
+```
+
+`prometheus.yml` scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: order_producer
+    static_configs:
+      - targets: ["host.docker.internal:8000"]   # /metrics on producer
+
+  - job_name: order_consumer
+    static_configs:
+      - targets: ["host.docker.internal:9090"]   # prometheus_client HTTP server
+```
+
+Key Grafana panels to build:
+
+| Panel | Query |
+|---|---|
+| Orders/sec (producer) | `rate(orders_published_total[1m])` |
+| Error rate | `rate(orders_failed_total[1m])` |
+| p99 latency | `histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[1m]))` |
+| Consumer insert rate | `rate(consumer_rows_inserted_total[1m])` |
+| Ack flush rate | `rate(consumer_acks_flushed_total[1m])` |
+| Circuit breaker state | `producer_circuit_breaker_state` / `consumer_circuit_breaker_state` |
+| Batch insert p99 | `histogram_quantile(0.99, rate(consumer_batch_duration_seconds_bucket[1m]))` |
+
+### Spring Boot — Micrometer
+
+Add the Actuator + Prometheus dependency to `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+Expose the endpoints in `application.yml`:
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+```
+
+Access at:
+- `GET /actuator/health` — liveness/readiness with datasource and Redis connection details
+- `GET /actuator/prometheus` — Prometheus scrape endpoint with JVM, HikariCP, and custom metrics
+
+Inject `MeterRegistry` to publish custom counters:
+
+```java
+@Autowired MeterRegistry registry;
+
+registry.counter("orders.published", "shard", String.valueOf(shardIdx)).increment();
+registry.timer("batch.insert.duration", "shard", String.valueOf(shardIdx))
+        .record(duration, TimeUnit.MILLISECONDS);
+```
+
+### Quarkus — SmallRye Metrics
+
+Add to `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>io.quarkus</groupId>
+  <artifactId>quarkus-micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+Enable in `application.properties`:
+
+```properties
+quarkus.micrometer.export.prometheus.enabled=true
+quarkus.micrometer.export.prometheus.path=/metrics
+quarkus.smallrye-health.root-path=/health
+```
+
+Inject and use `MeterRegistry` identically to Spring Boot. Access metrics at `GET /metrics` and health at `GET /health`.
