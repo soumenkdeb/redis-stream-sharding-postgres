@@ -15,6 +15,42 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from resilience import CircuitBreaker
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker auto-initialisation
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def init_circuit_breakers():
+    """
+    Ensure producer.redis_breakers and consumer.db_breaker / redis_breakers
+    are initialised and CLOSED before every test.  Also reset the ack buffers
+    so a successful test does not leave stale order_ids in _ack_buffers that
+    could affect the next test's time-based flush threshold.
+
+    autouse=True means this runs for every test in the suite without needing
+    to declare it explicitly — prevents IndexError when code accesses
+    breakers[shard_idx] and avoids state bleed between tests.
+    """
+    import producer as prod_module
+    import consumer as cons_module
+
+    prod_module.redis_breakers = [CircuitBreaker(f"redis-shard-{i}") for i in range(4)]
+    cons_module.db_breaker = CircuitBreaker("postgres")
+    cons_module.redis_breakers = [CircuitBreaker(f"redis-xack-{i}") for i in range(4)]
+    cons_module._ack_buffers.clear()
+    cons_module._ack_last_flush.clear()
+    yield
+    for b in prod_module.redis_breakers:
+        b.reset()
+    cons_module.db_breaker.reset()
+    for b in cons_module.redis_breakers:
+        b.reset()
+    cons_module._ack_buffers.clear()
+    cons_module._ack_last_flush.clear()
+
 
 # ---------------------------------------------------------------------------
 # Redis mock
