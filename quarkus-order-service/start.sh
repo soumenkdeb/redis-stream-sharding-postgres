@@ -10,18 +10,18 @@ usage() {
 Usage: $0 [MODE] [JVM/app overrides...]
 
 Modes:
-  both       (default) HTTP endpoint + consumer threads
-  producer   HTTP endpoint only — consumer threads disabled
-  consumer   Consumer threads only — HTTP returns 503
+  both       (default) HTTP endpoint + consumer threads on port 8001
+  producer   HTTP endpoint only on port 8001 — consumer threads disabled
+  consumer   Consumer threads only on port 8003 — HTTP returns 503
 
 JVM/app overrides are passed directly to the JVM, e.g.:
   $0 producer -Dquarkus.datasource.jdbc.url=jdbc:postgresql://db:5432/orders_db
   $0 consumer -Dapp.num-shards=2 -Dapp.consumer-name=worker-2
 
 Examples:
-  ./start.sh                           # both producer + consumer
-  ./start.sh producer                  # HTTP API only
-  ./start.sh consumer                  # background consumer only
+  ./start.sh                           # both producer + consumer on 8001
+  ./start.sh producer                  # HTTP API only on 8001
+  ./start.sh consumer                  # background consumer only on 8003
   ./start.sh both -Dapp.num-shards=8   # override shard count
 EOF
 }
@@ -29,8 +29,8 @@ EOF
 MODE="${1:-both}"
 case "$MODE" in
   both)     EXTRA_PROPS=() ;;
-  producer) EXTRA_PROPS=(-Dapp.consumer.enabled=false) ;;
-  consumer) EXTRA_PROPS=(-Dapp.producer.enabled=false) ;;
+  producer) EXTRA_PROPS=(-Dquarkus.profile=producer -Dapp.consumer.enabled=false) ;;
+  consumer) EXTRA_PROPS=(-Dquarkus.profile=consumer -Dapp.producer.enabled=false) ;;
   -h|--help) usage; exit 0 ;;
   *)
     echo "ERROR: Unknown mode '$MODE'"
@@ -51,7 +51,10 @@ fi
 
 CORES=$(nproc)
 
-echo "==> Quarkus order service [mode=$MODE, cores=$CORES]"
+PORT="8001"
+[[ "$MODE" == "consumer" ]] && PORT="8003"
+
+echo "==> Quarkus order service [mode=$MODE, port=$PORT, cores=$CORES]"
 echo "    JAR : $SCRIPT_DIR/$JAR"
 echo "    Props: ${EXTRA_PROPS[*]:-<none>}"
 

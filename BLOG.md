@@ -332,17 +332,24 @@ Discovering this required reading the Lettuce source rather than the documentati
 Both JVM services support a `MODE` parameter in `start.sh`:
 
 ```bash
-./start.sh producer   # HTTP active, consumer threads disabled, port 8000
-./start.sh consumer   # consumer threads active, HTTP returns 503, port 8002
-./start.sh both       # both active (default, for development), port 8000
+./start.sh producer   # HTTP active, consumer threads disabled
+./start.sh consumer   # consumer threads active, HTTP returns 503
+./start.sh both       # both active (default, for development)
 ```
 
-**Port assignment** (Spring Boot):
+**Port assignment**:
+
+Spring Boot:
 - Producer mode: `port 8000` (HTTP `/orders` and `/ack/*` endpoints)
 - Consumer mode: `port 8002` (processes streams, writes ACKs to Redis)
 - Both mode: `port 8000` (monolithic, development only)
 
-Ports are configured via Spring profiles (`application-producer.yml`, `application-consumer.yml`, `application.yml`), allowing producer and consumer to run simultaneously without port conflicts when deployed separately.
+Quarkus:
+- Producer mode: `port 8001` (HTTP `/orders` and `/ack/*` endpoints)
+- Consumer mode: `port 8003` (processes streams, writes ACKs to Redis)
+- Both mode: `port 8001` (monolithic, development only)
+
+Ports are configured via Spring/Quarkus profiles (`application-producer.properties`, `application-consumer.properties`), allowing producer and consumer to run simultaneously without port conflicts when deployed separately.
 
 This is implemented via conditional beans:
 
@@ -368,8 +375,11 @@ In production, producer pods and consumer pods scale independently. A spike in o
 
 **Load testing split deployment**:
 ```bash
-# Producer on 8000, consumer on 8002
+# Spring Boot: producer on 8000, consumer on 8002
 PRODUCER_URL=http://localhost:8000 ACK_URL=http://localhost:8002 python load_test_producer.py
+
+# Quarkus: producer on 8001, consumer on 8003
+PRODUCER_URL=http://localhost:8001 ACK_URL=http://localhost:8003 python load_test_producer.py
 ```
 
 ### Testing Java: Testcontainers

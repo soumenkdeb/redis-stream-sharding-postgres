@@ -260,19 +260,22 @@ mvn package -DskipTests
 cd quarkus-order-service
 mvn package -DskipTests
 
-# Both producer + consumer (default)
+# Both producer + consumer on port 8001 (default)
 ./start.sh
 
-# Producer only — consumer threads disabled
+# Producer only on port 8001 — consumer threads disabled
 ./start.sh producer
 
-# Consumer only — HTTP returns 503, consumer threads active
+# Consumer only on port 8003 — HTTP returns 503, consumer threads active
 ./start.sh consumer
 
 # Override properties at runtime
 ./start.sh consumer -Dapp.num-shards=8 -Dapp.consumer-name=worker-2
 
-# API available at http://localhost:8001
+# Ports
+# - Producer (POST /orders, GET /ack/*): port 8001
+# - Consumer (processes streams, writes ACKs): port 8003
+# - When both: port 8001
 ```
 
 ### 5. Send a Test Order
@@ -306,10 +309,16 @@ curl http://localhost:8000/ack/summary
 # {"total_acked":47823,"by_shard":[{"shard":0,"acked":11982},…]}
 ```
 
-Spring Boot exposes the same endpoints on port 8000; Quarkus on port 8001:
+Spring Boot exposes the same endpoints on port 8000 (producer mode) or 8002 (consumer mode). Quarkus on port 8001 (producer) or 8003 (consumer):
 ```bash
+# Spring Boot producer on 8000
+curl "http://localhost:8000/ack/status?ids=ORD-001"
+
+# Quarkus producer on 8001
 curl "http://localhost:8001/ack/status?ids=ORD-001"
-curl  http://localhost:8001/ack/summary
+
+# Quarkus consumer on 8003 (if running separately)
+curl "http://localhost:8003/ack/status?ids=ORD-001"
 ```
 
 ### 6. Run the Load Tests (Python)
@@ -444,32 +453,36 @@ Both JVM services support a `MODE` argument in `start.sh` to run as producer-onl
 
 ### Modes
 
-| Mode | HTTP `/orders` | Consumer threads | Port | Use case |
-|---|---|---|---|---|
-| `both` (default) | active | active | 8000 | Development, single-node |
-| `producer` | active | **disabled** | 8000 | Scale HTTP pods for ingestion |
-| `consumer` | returns 503 | active | 8002 | Scale consumer pods for processing |
+| Runtime | Mode | HTTP `/orders` | Consumer threads | Port | Use case |
+|---|---|---|---|---|---|
+| Spring Boot | `both` (default) | active | active | 8000 | Development, single-node |
+| Spring Boot | `producer` | active | **disabled** | 8000 | Scale HTTP pods for ingestion |
+| Spring Boot | `consumer` | returns 503 | active | 8002 | Scale consumer pods for processing |
+| Quarkus | `both` (default) | active | active | 8001 | Development, single-node |
+| Quarkus | `producer` | active | **disabled** | 8001 | Scale HTTP pods for ingestion |
+| Quarkus | `consumer` | returns 503 | active | 8003 | Scale consumer pods for processing |
 
 ### Split Deployment Example
 
 Start two terminals targeting the same Redis/PostgreSQL:
 
-**Terminal 1 — producer node on port 8000** (handles HTTP traffic):
+**Terminal 1 — producer node** (handles HTTP traffic):
 ```bash
-# Spring Boot
+# Spring Boot on port 8000
 cd spring-boot-order-service && ./start.sh producer
 # API at http://localhost:8000/orders and http://localhost:8000/ack/*
 
-# Quarkus (port 8001)
+# Quarkus on port 8001
 cd quarkus-order-service && ./start.sh producer
+# API at http://localhost:8001/orders and http://localhost:8001/ack/*
 ```
 
-**Terminal 2 — consumer node on port 8002** (processes from Redis streams):
+**Terminal 2 — consumer node** (processes from Redis streams):
 ```bash
-# Spring Boot
+# Spring Boot on port 8002
 cd spring-boot-order-service && ./start.sh consumer -Dapp.consumer-name=worker-1
 
-# Quarkus
+# Quarkus on port 8003
 cd quarkus-order-service && ./start.sh consumer -Dapp.consumer-name=worker-1
 ```
 
