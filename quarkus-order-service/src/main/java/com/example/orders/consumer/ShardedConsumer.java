@@ -174,7 +174,7 @@ public class ShardedConsumer {
 
         if (!msgIds.isEmpty()) {
             commands.xack(streamName, groupName, msgIds.toArray(new String[0]));
-            log.debugf("Shard %d flushed %d rows", shardIdx, msgIds.size());
+            log.infof("Shard %d consumed %d messages, inserted %d rows", shardIdx, messages.size(), msgIds.size());
 
             // ── Ack buffer ───────────────────────────────────────────────────
             // Each shard's virtual thread is sole writer of ackBuffers[shardIdx].
@@ -189,7 +189,7 @@ public class ShardedConsumer {
                 for (String oid : ackBuf) mapping.put(oid, ts);
                 commands.hset(ackKey, mapping);
                 commands.expire(ackKey, ACK_KEY_TTL);
-                log.debugf("Shard %d ack flush count=%d", shardIdx, ackBuf.size());
+                log.infof("Shard %d flushed %d ACKs to Redis", shardIdx, ackBuf.size());
                 ackBuf.clear();
                 ackLastFlushMs[shardIdx] = now;
             }

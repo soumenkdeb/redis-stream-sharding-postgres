@@ -8,6 +8,7 @@ import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.jboss.logging.Logger;
 
 import java.util.*;
 
@@ -26,6 +27,7 @@ import java.util.*;
 @Produces(MediaType.APPLICATION_JSON)
 public class AckResource {
 
+    private static final Logger log = Logger.getLogger(AckResource.class);
     private static final String ACK_KEY_BASE = "orders:acks";
     private static final int    MAX_IDS      = 10_000;
 
@@ -54,6 +56,8 @@ public class AckResource {
         if (orderIds.size() > MAX_IDS)
             return Response.status(400).entity(Map.of("error", "max " + MAX_IDS + " ids per request")).build();
 
+        log.debugf("ACK status query for %d order IDs", orderIds.size());
+
         // Group by shard — one HMGET per shard instead of one per order_id
         Map<Integer, List<String>> byShardMap = new HashMap<>();
         for (String oid : orderIds)
@@ -73,6 +77,8 @@ public class AckResource {
         long acked = result.values().stream().filter("acked"::equals).count();
         long total = result.size();
         double pct = total > 0 ? Math.round(acked * 10_000.0 / total) / 100.0 : 0.0;
+
+        log.infof("ACK status: %d/%d acked (%.2f%%)", acked, total, pct);
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("total", total);
@@ -95,6 +101,7 @@ public class AckResource {
             byShardList.add(Map.of("shard", i, "acked", count));
             totalAcked += count;
         }
+        log.infof("ACK summary: %d total acked across %d shards", totalAcked, numShards);
         return Map.of("total_acked", totalAcked, "by_shard", byShardList);
     }
 

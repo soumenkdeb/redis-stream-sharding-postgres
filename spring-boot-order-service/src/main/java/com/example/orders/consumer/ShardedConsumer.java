@@ -168,7 +168,7 @@ public class ShardedConsumer implements ApplicationRunner {
 
         // Varargs XACK — one command for the whole batch
         commands.xack(streamName, groupName, msgIds.toArray(new String[0]));
-        log.debug("Shard {} flushed {} rows", shardIdx, batchArgs.size());
+        log.info("Shard {} consumed {} messages, inserted {} rows", shardIdx, messages.size(), batchArgs.size());
 
         // ── Ack buffer ───────────────────────────────────────────────────────
         // Accumulate order_ids and flush to Redis Hash when threshold is met.
@@ -184,7 +184,7 @@ public class ShardedConsumer implements ApplicationRunner {
             for (String oid : ackBuf) mapping.put(oid, ts);
             commands.hset(ackKey, mapping);
             commands.expire(ackKey, ACK_KEY_TTL);
-            log.debug("Shard {} ack flush count={}", shardIdx, ackBuf.size());
+            log.info("Shard {} flushed {} ACKs to Redis", shardIdx, ackBuf.size());
             ackBuf.clear();
             ackLastFlushMs[shardIdx] = now;
         }
