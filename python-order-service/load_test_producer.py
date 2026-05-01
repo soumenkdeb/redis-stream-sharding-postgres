@@ -15,7 +15,8 @@ Usage:
     python load_test_producer.py
 
 Environment overrides:
-    PRODUCER_URL=http://localhost:8000   target host
+    PRODUCER_URL=http://localhost:8000   POST /orders endpoint
+    ACK_URL=http://localhost:8000        GET /ack/* endpoints (defaults to PRODUCER_URL if unset)
     TOTAL_ORDERS=100000                  total orders to send
     CONCURRENCY=200                      simultaneous in-flight requests
     ACK_POLL_TIMEOUT=300                 seconds to wait for 100% ack
@@ -33,6 +34,7 @@ import httpx
 load_dotenv()
 
 PRODUCER_URL     = os.getenv("PRODUCER_URL", "http://localhost:8000")
+ACK_URL          = os.getenv("ACK_URL", "http://localhost:8000")
 TOTAL_ORDERS     = int(os.getenv("TOTAL_ORDERS", 100_000))
 CONCURRENCY      = int(os.getenv("CONCURRENCY", 200))
 ACK_POLL_TIMEOUT = float(os.getenv("ACK_POLL_TIMEOUT", "300"))
@@ -98,7 +100,7 @@ async def poll_ack_status(client: httpx.AsyncClient, order_ids: list[str]) -> No
             ids_param = ",".join(chunk)
             try:
                 r = await client.get(
-                    f"{PRODUCER_URL}/ack/status",
+                    f"{ACK_URL}/ack/status",
                     params={"ids": ids_param},
                     timeout=15.0,
                 )
@@ -107,9 +109,12 @@ async def poll_ack_status(client: httpx.AsyncClient, order_ids: list[str]) -> No
                     acked += data["acked"]
                 else:
                     errors += 1
+                    if errors == 1:  # print first error only
+                        print(f"  ❌ HTTP {r.status_code} from {ACK_URL}/ack/status: {r.text[:200]}")
             except Exception as e:
                 errors += 1
-                print(f"  ack poll error: {e}")
+                if errors == 1:  # print first error only
+                    print(f"  ❌ Connection error: {e}")
 
         delta = acked - last_acked
         last_acked = acked
@@ -130,7 +135,9 @@ async def poll_ack_status(client: httpx.AsyncClient, order_ids: list[str]) -> No
 
 
 async def main() -> None:
-    print(f"HTTP load test → {PRODUCER_URL}/orders")
+    print(f"HTTP load test")
+    print(f"  POST orders   : {PRODUCER_URL}/orders")
+    print(f"  GET ack status: {ACK_URL}/ack/*")
     print(f"  orders={TOTAL_ORDERS:,}  concurrency={CONCURRENCY}")
     print()
 

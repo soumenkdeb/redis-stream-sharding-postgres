@@ -236,19 +236,22 @@ NUM_SHARDS=8 CONSUMER_NAME=worker-2 python consumer.py
 cd spring-boot-order-service
 mvn package -DskipTests
 
-# Both producer + consumer (default)
+# Both producer + consumer on port 8000 (default)
 ./start.sh
 
-# Producer only — consumer threads disabled
+# Producer only on port 8000 — consumer threads disabled
 ./start.sh producer
 
-# Consumer only — HTTP returns 503, consumer threads active
+# Consumer only on port 8002 — HTTP returns 503, consumer threads active
 ./start.sh consumer
 
 # Override properties at runtime
 ./start.sh both -Dapp.num-shards=8 -Dapp.consumer-name=worker-1
 
-# API available at http://localhost:8000
+# Ports
+# - Producer (POST /orders, GET /ack/*): port 8000
+# - Consumer (processes streams, writes ACKs): port 8002
+# - When both: port 8000
 ```
 
 ### 4. Quarkus
@@ -358,9 +361,20 @@ Phase 2 output example:
 
 | Var | Default | Meaning |
 |-----|---------|---------|
+| `PRODUCER_URL` | http://localhost:8000 | POST /orders endpoint (HTTP ingestion) |
+| `ACK_URL` | (same as PRODUCER_URL) | GET /ack/* endpoints (status polling) — set separately if consumer on different port |
 | `ACK_POLL_TIMEOUT` | 300 | Seconds to wait for 100% ack before giving up |
 | `ACK_POLL_INTERVAL` | 3 | Seconds between poll rounds |
-| `ACK_CHUNK_SIZE` | 1000 | `order_id`s per `/ack/status` request |
+| `ACK_CHUNK_SIZE` | 1000 | `order_id`s per `/ack/status` request (reduce to 100–200 if hitting HTTP 414 URI Too Long) |
+
+**Example** — separate producer and consumer servers:
+```bash
+# Producer on 8000, consumer on 8002 (split deployment)
+PRODUCER_URL=http://localhost:8000 ACK_URL=http://localhost:8002 python load_test_producer.py
+
+# Or reduce chunk size to avoid large query strings
+ACK_CHUNK_SIZE=100 python load_test_producer.py
+```
 
 ### 7. Run Tests
 
@@ -430,26 +444,27 @@ Both JVM services support a `MODE` argument in `start.sh` to run as producer-onl
 
 ### Modes
 
-| Mode | HTTP `/orders` | Consumer threads | Use case |
-|---|---|---|---|
-| `both` (default) | active | active | Development, single-node |
-| `producer` | active | **disabled** | Scale HTTP pods for ingestion |
-| `consumer` | returns 503 | active | Scale consumer pods for processing |
+| Mode | HTTP `/orders` | Consumer threads | Port | Use case |
+|---|---|---|---|---|
+| `both` (default) | active | active | 8000 | Development, single-node |
+| `producer` | active | **disabled** | 8000 | Scale HTTP pods for ingestion |
+| `consumer` | returns 503 | active | 8002 | Scale consumer pods for processing |
 
 ### Split Deployment Example
 
 Start two terminals targeting the same Redis/PostgreSQL:
 
-**Terminal 1 — producer node** (handles HTTP traffic):
+**Terminal 1 — producer node on port 8000** (handles HTTP traffic):
 ```bash
 # Spring Boot
 cd spring-boot-order-service && ./start.sh producer
+# API at http://localhost:8000/orders and http://localhost:8000/ack/*
 
 # Quarkus (port 8001)
 cd quarkus-order-service && ./start.sh producer
 ```
 
-**Terminal 2 — consumer node** (processes from Redis streams):
+**Terminal 2 — consumer node on port 8002** (processes from Redis streams):
 ```bash
 # Spring Boot
 cd spring-boot-order-service && ./start.sh consumer -Dapp.consumer-name=worker-1
@@ -459,6 +474,14 @@ cd quarkus-order-service && ./start.sh consumer -Dapp.consumer-name=worker-1
 ```
 
 Multiple consumer nodes can run simultaneously — each must have a unique `app.consumer-name` so Redis tracks their independent cursor positions within the consumer group. Messages are distributed across consumers by Redis (competing consumers model).
+
+**Load testing against split deployment**:
+
+When producer and consumer run on separate ports, point the load test to each:
+```bash
+# Producer on 8000, consumer on 8002
+PRODUCER_URL=http://localhost:8000 ACK_URL=http://localhost:8002 python load_test_producer.py
+```
 
 ### Overriding Any Property
 
@@ -593,6 +616,20 @@ AgroalDataSource dataSource;   // correct for Quarkus 3.x
 ```
 
 Add `quarkus-agroal` as an explicit dependency (not just transitive) and set `quarkus.datasource.devservices.enabled=false` to prevent DevServices from interfering when an explicit JDBC URL is configured.
+
+### Netty HTTP Line Length for Large Requests
+
+When running `/ack/status` queries with many order IDs in the query string, the HTTP request line can exceed the default Netty limit of 4096 bytes, returning HTTP 414 (URI Too Long). Spring Boot applications use:
+
+```yaml
+server:
+  netty:
+    max-initial-line-length: 65536  # 64 KB — handles ~2500 order IDs per request
+```
+
+This is configured in `application.yml`, `application-producer.yml`, and `application-consumer.yml`. If load tests still hit 414, either:
+1. Reduce `ACK_CHUNK_SIZE` in the load test (e.g., `ACK_CHUNK_SIZE=100`)
+2. Increase `max-initial-line-length` further (e.g., to `131072`)
 
 ### Ack Aggregator — End-to-End Processing Confirmation
 

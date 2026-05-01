@@ -332,10 +332,17 @@ Discovering this required reading the Lettuce source rather than the documentati
 Both JVM services support a `MODE` parameter in `start.sh`:
 
 ```bash
-./start.sh producer   # HTTP active, consumer threads disabled
-./start.sh consumer   # consumer threads active, HTTP returns 503
-./start.sh both       # both active (default, for development)
+./start.sh producer   # HTTP active, consumer threads disabled, port 8000
+./start.sh consumer   # consumer threads active, HTTP returns 503, port 8002
+./start.sh both       # both active (default, for development), port 8000
 ```
+
+**Port assignment** (Spring Boot):
+- Producer mode: `port 8000` (HTTP `/orders` and `/ack/*` endpoints)
+- Consumer mode: `port 8002` (processes streams, writes ACKs to Redis)
+- Both mode: `port 8000` (monolithic, development only)
+
+Ports are configured via Spring profiles (`application-producer.yml`, `application-consumer.yml`, `application.yml`), allowing producer and consumer to run simultaneously without port conflicts when deployed separately.
 
 This is implemented via conditional beans:
 
@@ -357,7 +364,13 @@ void onStart(@Observes StartupEvent ev) {
 }
 ```
 
-In production, producer pods and consumer pods scale independently. A spike in order volume scales producer pods; a growing Redis backlog scales consumer pods.
+In production, producer pods and consumer pods scale independently. A spike in order volume scales producer pods; a growing Redis backlog scales consumer pods. Load tests can target the producer on one port and query ACKs on the consumer's port via the `ACK_URL` environment variable.
+
+**Load testing split deployment**:
+```bash
+# Producer on 8000, consumer on 8002
+PRODUCER_URL=http://localhost:8000 ACK_URL=http://localhost:8002 python load_test_producer.py
+```
 
 ### Testing Java: Testcontainers
 
@@ -720,6 +733,11 @@ Full suite: **76 tests, all passing**, no infrastructure required.
 | Poll timeout (load test) | `ACK_POLL_TIMEOUT` | 300s | How long to wait for 100% ack |
 | Poll interval (load test) | `ACK_POLL_INTERVAL` | 3s | Seconds between poll rounds |
 | Chunk size (load test) | `ACK_CHUNK_SIZE` | 1000 | Order IDs per `/ack/status` request |
+| Producer URL | `PRODUCER_URL` (load test) | http://localhost:8000 | HTTP endpoint for `/orders` |
+| ACK URL | `ACK_URL` (load test) | same as PRODUCER_URL | HTTP endpoint for `/ack/*` (query a different server if split deployment) |
+| Netty HTTP line length | `server.netty.max-initial-line-length` (Spring Boot) | 65536 | Max bytes for HTTP request line. Increase if `/ack/status` hits HTTP 414 with large ID lists. |
+
+**HTTP line length note**: when querying `/ack/status?ids=ORD-1,ORD-2,…` with many order IDs, the query string can exceed the HTTP server's line-length limit, returning HTTP 414 (URI Too Long). Spring Boot is configured to 64 KB by default, but this can be reduced by increasing `ACK_CHUNK_SIZE` in the load test (e.g., `ACK_CHUNK_SIZE=100` instead of the default 1000).
 
 ---
 

@@ -1,7 +1,7 @@
 server:
   port: 8002
   netty:
-    max-initial-line-length: 8192
+    max-initial-line-length: 65536
 
 spring:
   jackson:
