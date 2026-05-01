@@ -30,8 +30,8 @@ EOF
 MODE="${1:-both}"
 case "$MODE" in
   both)     EXTRA_PROPS=() ;;
-  producer) EXTRA_PROPS=(-Dapp.consumer.enabled=false) ;;
-  consumer) EXTRA_PROPS=(-Dapp.producer.enabled=false) ;;
+  producer) EXTRA_PROPS=(-Dspring.profiles.active=producer -Dapp.consumer.enabled=false) ;;
+  consumer) EXTRA_PROPS=(-Dspring.profiles.active=consumer -Dapp.producer.enabled=false) ;;
   -h|--help) usage; exit 0 ;;
   *)
     echo "ERROR: Unknown mode '$MODE'"

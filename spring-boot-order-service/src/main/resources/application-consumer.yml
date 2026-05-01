@@ -1,5 +1,5 @@
 server:
-  port: 8000
+  port: 8002
   netty:
     max-initial-line-length: 8192
 
@@ -14,9 +14,6 @@ spring:
     hikari:
       maximum-pool-size: 20
       minimum-idle: 5
-      # Skip WAL fsync per commit — Postgres acks before disk flush.
-      # Saves ~1-5 ms per transaction. Risk: up to ~200 ms of data on a hard crash;
-      # acceptable here because Redis retains unacked messages in the PEL.
       connection-init-sql: "SET synchronous_commit = off"
 
 app:
@@ -27,5 +24,5 @@ app:
   stream-base: orders:stream
   group-name: order_processors
   consumer-name: spring-consumer-1
-  ack-batch-size: 500       # flush ack hash after N order_ids
-  ack-flush-interval-ms: 5000   # or after 5 s, whichever comes first
+  ack-batch-size: 500
+  ack-flush-interval-ms: 5000
